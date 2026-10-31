@@ -6,7 +6,8 @@ from pathlib import Path
 import asyncio
 
 import httpx
-import animesaturn as asaturn
+import cloudscraper
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -20,8 +21,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
-# Lista de animes a seguir (puedes poner los nombres exactos)
-ANIME_LIST = ["Black Clover", "Jujutsu Kaisen"]
+# Lista de animes a seguir (Slugs de AnimeFLV)
+ANIME_LIST = ["black-clover", "jujutsu-kaisen"]
 
 TEMP_DIR = Path("temp_videos")
 TEMP_DIR.mkdir(exist_ok=True)
@@ -29,44 +30,66 @@ TEMP_DIR.mkdir(exist_ok=True)
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 estado = {"activo": True, "ultima_publicacion": "Nunca"}
 
-# ---------- SCRAPING CON ANIMESATURN ----------
-async def obtener_ultimo_episodio(nombre_anime: str):
+# ---------- SCRAPING CON CLOUDSCRAPER (Anti-Cloudflare) ----------
+async def obtener_ultimo_episodio(anime_slug: str):
     try:
-        # La librería es síncrona, la ejecutamos en un hilo aparte
+        # cloudscraper es síncrono, lo ejecutamos en un hilo para no bloquear
         loop = asyncio.get_running_loop()
         
-        def buscar_y_obtener():
-            # 1. Buscar el anime
-            resultados = asaturn.find(nombre_anime)
-            if not resultados:
+        def buscar_enlace():
+            scraper = cloudscraper.create_scraper()
+            base_url = "https://www3.animeflv.net"
+            
+            # 1. Obtener página del anime
+            r = scraper.get(f"{base_url}/anime/{anime_slug}")
+            if r.status_code != 200:
+                logging.error(f"Error {r.status_code} al acceder a {anime_slug}")
                 return None, None, None
             
-            anime = asaturn.Anime(resultados[0]['link'])
-            episodios = anime.getEpisodes()
+            soup = BeautifulSoup(r.text, "html.parser")
+            episodios = soup.select("ul.ListEpisodios li a")
             if not episodios:
                 return None, None, None
             
-            ultimo_ep = episodios[-1]
-            servidores = ultimo_ep.getServer()
-            if not servidores:
-                return None, None, None
+            # Tomamos el último episodio de la lista
+            ultimo_ep_url = episodios[-1]["href"]
+            if not ultimo_ep_url.startswith("http"):
+                ultimo_ep_url = f"{base_url}{ultimo_ep_url}"
             
-            # 2. Obtener el enlace de descarga directa
-            enlace = servidores[0].fileLink()
-            return anime.name, str(ultimo_ep.number), enlace
-        
-        nombre_real, num_cap, url_descarga = await loop.run_in_executor(None, buscar_y_obtener)
-        
-        if url_descarga:
-            return nombre_real, num_cap, url_descarga
-        return None, None, None
+            num_capitulo = ultimo_ep_url.strip("/").split("/")[-1]
+
+            # 2. Entrar al episodio para extraer el enlace de descarga
+            r_ep = scraper.get(ultimo_ep_url)
+            soup_ep = BeautifulSoup(r_ep.text, "html.parser")
+            
+            enlace_descarga = None
+            # Buscamos enlaces que sean de descarga directa (mp4) y que sean "SUB" (subtitulado)
+            for a in soup_ep.find_all("a", href=True):
+                href = a["href"]
+                texto = a.get_text().lower()
+                if ".mp4" in href and ("sub" in texto or "subtitulado" in texto):
+                    enlace_descarga = href
+                    break
+            
+            # Si no encontramos uno explícitamente "sub", tomamos el primer .mp4
+            if not enlace_descarga:
+                for a in soup_ep.find_all("a", href=True):
+                    if ".mp4" in a["href"]:
+                        enlace_descarga = a["href"]
+                        break
+
+            return anime_slug.replace("-", " ").title(), num_capitulo, enlace_descarga
+
+        nombre, cap, url = await loop.run_in_executor(None, buscar_enlace)
+        return nombre, cap, url
+
     except Exception as e:
-        logging.error(f"Error en scraping de {nombre_anime}: {e}")
+        logging.error(f"Error en scraping de {anime_slug}: {e}")
         return None, None, None
 
 # ---------- DESCARGA Y DIVISIÓN ----------
 async def descargar_video(url: str, destino: Path):
-    # AnimeSaturn no bloquea la descarga directa
+    # La descarga del .mp4 se hace con httpx, que suele funcionar bien con los servidores de archivos
     async with httpx.AsyncClient(follow_redirects=True, timeout=120) as client:
         async with client.stream("GET", url) as resp:
             resp.raise_for_status()
@@ -75,7 +98,7 @@ async def descargar_video(url: str, destino: Path):
                     f.write(chunk)
     return destino
 
-def dividir_video(ruta_entrada: Path, tamano_max_mb: int = 45):
+def dividir_video(ruta_entrada: Path, tamano_max_mb: int = 30):
     try:
         cmd_dur = [
             "ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -84,6 +107,10 @@ def dividir_video(ruta_entrada: Path, tamano_max_mb: int = 45):
         duracion = float(subprocess.check_output(cmd_dur).strip())
         tamano_mb = ruta_entrada.stat().st_size / (1024 * 1024)
         
+        if tamano_mb < 45:
+            logging.info(f"El video pesa {tamano_mb:.2f} MB. No requiere división.")
+            return [ruta_entrada]
+
         num_partes = max(1, math.ceil(tamano_mb / tamano_max_mb))
         dur_parte = duracion / num_partes
 
@@ -98,7 +125,8 @@ def dividir_video(ruta_entrada: Path, tamano_max_mb: int = 45):
         partes = sorted([
             p for p in ruta_entrada.parent.glob(ruta_entrada.stem + "_parte_*.mp4")
         ])
-        return partes
+        partes = [p for p in partes if p.stat().st_size > 0]
+        return partes if partes else [ruta_entrada]
     except Exception as e:
         logging.error(f"Error al dividir video: {e}")
         return [ruta_entrada]
@@ -114,6 +142,9 @@ async def publicar_episodio(bot, nombre_anime: str, hashtag: str, capitulo: str,
         partes = dividir_video(ruta_original)
 
         for i, parte in enumerate(partes, start=1):
+            tam_parte_mb = parte.stat().st_size / (1024 * 1024)
+            logging.info(f"Enviando parte {i}/{len(partes)} (Peso: {tam_parte_mb:.2f} MB)...")
+            
             caption = f"**{nombre_anime}**\nCapítulo {capitulo}"
             if len(partes) > 1:
                 caption += f" (Parte {i}/{len(partes)})"
@@ -138,11 +169,13 @@ async def publicar_episodio(bot, nombre_anime: str, hashtag: str, capitulo: str,
 async def job_publicacion(context: ContextTypes.DEFAULT_TYPE):
     if not estado["activo"]:
         return
-    for nombre_anime in ANIME_LIST:
-        nombre, cap, url = await obtener_ultimo_episodio(nombre_anime)
+    for anime_slug in ANIME_LIST:
+        nombre, cap, url = await obtener_ultimo_episodio(anime_slug)
         if url:
             hashtag = "".join(filter(str.isalnum, nombre))
             await publicar_episodio(context.bot, nombre, hashtag, cap, url)
+        else:
+            logging.warning(f"No se pudo obtener enlace para {anime_slug}")
 
 # ---------- PANEL DE CONTROL ----------
 def construir_panel():
@@ -181,7 +214,7 @@ async def boton_pulsado(update: Update, context: ContextTypes.DEFAULT_TYPE):
         texto, markup = construir_panel()
         await query.edit_message_text(texto, reply_markup=markup, parse_mode="Markdown")
     elif query.data == "lista":
-        lista = "\n".join(f"• {a}" for a in ANIME_LIST)
+        lista = "\n".join(f"• {a.replace('-', ' ').title()}" for a in ANIME_LIST)
         texto = f"**Animes en seguimiento:**\n{lista}"
         await query.edit_message_text(texto, parse_mode="Markdown")
 
