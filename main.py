@@ -9,6 +9,8 @@ from urllib.parse import urljoin
 import httpx
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from curl_cffi.requests import AsyncSession  # Nueva librería para saltar Cloudflare
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -19,22 +21,19 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
-# Convertimos el ID a entero para evitar problemas con el filtro de Telegram
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
-# Configuración para JKAnime (más permisivo con servidores gratuitos)
+# Configuración para JKAnime
 BASE_URL = "https://jkanime.net"
-ANIME_LIST = ["black-clover", "jujutsu-kaisen"]  # Slugs de JKAnime
+ANIME_LIST = ["black-clover", "jujutsu-kaisen"]  # Puedes agregar más
 
 TEMP_DIR = Path("temp_videos")
 TEMP_DIR.mkdir(exist_ok=True)
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-
-# Estado global simple
 estado = {"activo": True, "ultima_publicacion": "Nunca"}
 
-# Cabeceras para evitar bloqueos
+# Cabeceras para la descarga del video (esto no lo bloquea Cloudflare)
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
@@ -44,46 +43,52 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         await update.message.reply_text("⛔ No tienes permiso para usar este bot.")
         return
-    
     await update.message.reply_text(
         f"¡Hola! Soy tu bot publicador de anime. 🤖\n\n"
-        f"Para abrir el menú de control y gestionar las publicaciones, usa el comando:\n"
-        f"👉 /panel"
+        f"Para abrir el menú de control, usa el comando:\n👉 /panel"
     )
 
-# ---------- SCRAPING LIGERO (JKAnime) ----------
+# ---------- SCRAPING CON CURL_CFFI (Anti-Cloudflare) ----------
 async def obtener_ultimo_episodio(anime_slug: str):
-    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=30) as client:
-        try:
-            r = await client.get(f"{BASE_URL}/{anime_slug}/")
-            if r.status_code != 200:
-                return None, None
+    try:
+        # Usamos curl_cffi simulando ser Chrome
+        async with AsyncSession() as client:
+            r = await client.get(f"{BASE_URL}/{anime_slug}/", impersonate="chrome")
             
+            if r.status_code != 200:
+                logging.error(f"Error {r.status_code} al acceder a {anime_slug}")
+                return None, None
+                
             soup = BeautifulSoup(r.text, "html.parser")
             episodios = soup.select("a.anime__row__item")
+            
             if not episodios:
+                logging.warning(f"No se encontraron episodios para {anime_slug}")
                 return None, None
                 
             ultimo_ep_url = urljoin(BASE_URL, episodios[0]["href"])
             partes_url = ultimo_ep_url.strip("/").split("/")
             num_capitulo = partes_url[-1] if partes_url[-1].isdigit() else "1"
 
-            r_ep = await client.get(ultimo_ep_url)
+            # Entrar al episodio
+            r_ep = await client.get(ultimo_ep_url, impersonate="chrome")
             soup_ep = BeautifulSoup(r_ep.text, "html.parser")
             
             enlace_descarga = None
+            # Buscar enlaces de descarga (mp4, um.php, etc)
             for a in soup_ep.find_all("a", href=True):
-                if ".mp4" in a["href"] or "um.php" in a["href"] or "desu" in a["href"]:
-                    enlace_descarga = a["href"]
+                href = a["href"]
+                if ".mp4" in href or "um.php" in href or "desu" in href:
+                    enlace_descarga = href
                     break
             
             if enlace_descarga:
                 return num_capitulo, enlace_descarga
             return None, None
 
-        except Exception as e:
-            logging.error(f"Error en scraping de {anime_slug}: {e}")
-            return None, None
+    except Exception as e:
+        logging.error(f"Error en scraping de {anime_slug}: {e}")
+        return None, None
 
 # ---------- DESCARGA Y DIVISIÓN ----------
 async def descargar_video(url: str, destino: Path):
@@ -134,29 +139,20 @@ async def publicar_episodio(bot, nombre_anime: str, hashtag: str, capitulo: str,
         partes = dividir_video(ruta_original)
 
         for i, parte in enumerate(partes, start=1):
-            caption = (
-                f"**{nombre_anime}**\n"
-                f"Capítulo {capitulo}"
-            )
+            caption = f"**{nombre_anime}**\nCapítulo {capitulo}"
             if len(partes) > 1:
                 caption += f" (Parte {i}/{len(partes)})"
-                
-            caption += (
-                f"\n\n#{hashtag}\n"
-                f"📢 Comparte: https://t.me/tu_canal"
-            )
+            caption += f"\n\n#{hashtag}\n📢 Comparte: https://t.me/tu_canal"
             
             with open(parte, "rb") as video:
                 await bot.send_video(
-                    chat_id=CHANNEL_ID, 
-                    video=video, 
-                    caption=caption,
-                    parse_mode="Markdown", 
-                    supports_streaming=True
+                    chat_id=CHANNEL_ID, video=video, caption=caption,
+                    parse_mode="Markdown", supports_streaming=True
                 )
             parte.unlink(missing_ok=True)
             
         estado["ultima_publicacion"] = f"{nombre_anime} - Cap {capitulo}"
+        logging.info(f"Publicado exitosamente: {nombre_anime} Cap {capitulo}")
         
     except Exception as e:
         logging.error(f"Error publicando {nombre_anime} {capitulo}: {e}")
@@ -183,10 +179,7 @@ def construir_panel():
         f"Animes en seguimiento: {len(ANIME_LIST)}"
     )
     teclado = [
-        [InlineKeyboardButton(
-            "⏸️ Pausar" if estado["activo"] else "▶️ Reanudar",
-            callback_data="toggle"
-        )],
+        [InlineKeyboardButton("⏸️ Pausar" if estado["activo"] else "▶️ Reanudar", callback_data="toggle")],
         [InlineKeyboardButton("🔄 Forzar comprobación", callback_data="forzar")],
         [InlineKeyboardButton("📋 Ver animes", callback_data="lista")],
     ]
@@ -194,7 +187,7 @@ def construir_panel():
 
 async def panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text(f"⛔ No tienes permiso. Tu ID es {update.effective_user.id}, pero el bot espera {OWNER_ID}.")
+        await update.message.reply_text(f"⛔ No tienes permiso. Tu ID es {update.effective_user.id}")
         return
     texto, markup = construir_panel()
     await update.message.reply_text(texto, reply_markup=markup, parse_mode="Markdown")
@@ -202,9 +195,7 @@ async def panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def boton_pulsado(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    
-    if query.from_user.id != OWNER_ID:
-        return
+    if query.from_user.id != OWNER_ID: return
 
     if query.data == "toggle":
         estado["activo"] = not estado["activo"]
@@ -212,7 +203,7 @@ async def boton_pulsado(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(texto, reply_markup=markup, parse_mode="Markdown")
         
     elif query.data == "forzar":
-        await query.edit_message_text("⏳ Buscando y publicando... (esto puede tardar unos minutos)", parse_mode="Markdown")
+        await query.edit_message_text("⏳ Buscando y publicando... (esto puede tardar)", parse_mode="Markdown")
         await job_publicacion(context)
         texto, markup = construir_panel()
         await query.edit_message_text(texto, reply_markup=markup, parse_mode="Markdown")
@@ -225,15 +216,11 @@ async def boton_pulsado(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- MAIN ----------
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
-
-    # Añadimos los comandos
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("panel", panel))
     app.add_handler(CallbackQueryHandler(boton_pulsado))
-
-    # Job cada 6 horas
     app.job_queue.run_repeating(job_publicacion, interval=6*3600, first=10)
-
+    
     logging.info("Bot iniciado correctamente. Esperando comandos...")
     app.run_polling()
 
