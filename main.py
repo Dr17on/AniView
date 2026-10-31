@@ -24,7 +24,7 @@ OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
 # Configuración para JKAnime (más permisivo con servidores gratuitos)
 BASE_URL = "https://jkanime.net"
-ANIME_LIST = ["shingeki-no-kyojin", "jujutsu-kaisen"]  # Slugs de JKAnime
+ANIME_LIST = ["black-clover", "jujutsu-kaisen"]  # Slugs de JKAnime
 
 TEMP_DIR = Path("temp_videos")
 TEMP_DIR.mkdir(exist_ok=True)
@@ -39,36 +39,38 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
+# ---------- COMANDO START ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("⛔ No tienes permiso para usar este bot.")
+        return
+    
+    await update.message.reply_text(
+        f"¡Hola! Soy tu bot publicador de anime. 🤖\n\n"
+        f"Para abrir el menú de control y gestionar las publicaciones, usa el comando:\n"
+        f"👉 /panel"
+    )
+
 # ---------- SCRAPING LIGERO (JKAnime) ----------
 async def obtener_ultimo_episodio(anime_slug: str):
-    """Devuelve (num_episodio, url_descarga) del último episodio en JKAnime."""
     async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=30) as client:
         try:
-            # 1. Obtener la página principal del anime
             r = await client.get(f"{BASE_URL}/{anime_slug}/")
             if r.status_code != 200:
-                logging.error(f"Error al acceder a {anime_slug}: HTTP {r.status_code}")
                 return None, None
             
             soup = BeautifulSoup(r.text, "html.parser")
-            
-            # Buscar el enlace del último episodio (suele ser el primero en la lista)
-            # En JKAnime, los episodios están en una lista con clase "anime__row__item"
             episodios = soup.select("a.anime__row__item")
             if not episodios:
                 return None, None
                 
             ultimo_ep_url = urljoin(BASE_URL, episodios[0]["href"])
-            # Extraer el número de capítulo de la URL (ej: .../shingeki-no-kyojin/1/)
             partes_url = ultimo_ep_url.strip("/").split("/")
             num_capitulo = partes_url[-1] if partes_url[-1].isdigit() else "1"
 
-            # 2. Entrar a la página del episodio para buscar el enlace de descarga
             r_ep = await client.get(ultimo_ep_url)
             soup_ep = BeautifulSoup(r_ep.text, "html.parser")
             
-            # Buscar el enlace de descarga directa (JKAnime usa varios servidores)
-            # Buscamos enlaces que terminen en .mp4 o que apunten a servidores de descarga
             enlace_descarga = None
             for a in soup_ep.find_all("a", href=True):
                 if ".mp4" in a["href"] or "um.php" in a["href"] or "desu" in a["href"]:
@@ -94,7 +96,6 @@ async def descargar_video(url: str, destino: Path):
     return destino
 
 def dividir_video(ruta_entrada: Path, tamano_max_mb: int = 45):
-    """Divide el video en partes de menos de 45 MB usando FFmpeg sin recodificar."""
     try:
         cmd_dur = [
             "ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -120,7 +121,7 @@ def dividir_video(ruta_entrada: Path, tamano_max_mb: int = 45):
         return partes
     except Exception as e:
         logging.error(f"Error al dividir video: {e}")
-        return [ruta_entrada] # Si falla, devuelve el original
+        return [ruta_entrada]
 
 # ---------- PUBLICACIÓN ----------
 async def publicar_episodio(bot, nombre_anime: str, hashtag: str, capitulo: str, url_descarga: str):
@@ -153,7 +154,7 @@ async def publicar_episodio(bot, nombre_anime: str, hashtag: str, capitulo: str,
                     parse_mode="Markdown", 
                     supports_streaming=True
                 )
-            parte.unlink(missing_ok=True)  # limpieza inmediata
+            parte.unlink(missing_ok=True)
             
         estado["ultima_publicacion"] = f"{nombre_anime} - Cap {capitulo}"
         
@@ -225,6 +226,8 @@ async def boton_pulsado(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # Añadimos los comandos
+    app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("panel", panel))
     app.add_handler(CallbackQueryHandler(boton_pulsado))
 
