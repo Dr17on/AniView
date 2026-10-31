@@ -9,7 +9,7 @@ from urllib.parse import urljoin
 import httpx
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from curl_cffi.requests import AsyncSession  # Nueva librería para saltar Cloudflare
+from curl_cffi.requests import AsyncSession
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -23,9 +23,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
-# Configuración para JKAnime
-BASE_URL = "https://jkanime.net"
-ANIME_LIST = ["black-clover", "jujutsu-kaisen"]  # Puedes agregar más
+# Configuración para AnimeFLV
+BASE_URL = "https://animeflv.net"
+ANIME_LIST = ["black-clover", "jujutsu-kaisen"]
 
 TEMP_DIR = Path("temp_videos")
 TEMP_DIR.mkdir(exist_ok=True)
@@ -33,7 +33,6 @@ TEMP_DIR.mkdir(exist_ok=True)
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 estado = {"activo": True, "ultima_publicacion": "Nunca"}
 
-# Cabeceras para la descarga del video (esto no lo bloquea Cloudflare)
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
@@ -48,37 +47,36 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Para abrir el menú de control, usa el comando:\n👉 /panel"
     )
 
-# ---------- SCRAPING CON CURL_CFFI (Anti-Cloudflare) ----------
+# ---------- SCRAPING CON ANIMEFLV ----------
 async def obtener_ultimo_episodio(anime_slug: str):
     try:
-        # Usamos curl_cffi simulando ser Chrome
-        async with AsyncSession() as client:
-            r = await client.get(f"{BASE_URL}/{anime_slug}/", impersonate="chrome")
-            
+        # Intentamos con httpx + User-Agent falso (suele funcionar en AnimeFLV)
+        async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=30) as client:
+            r = await client.get(f"{BASE_URL}/anime/{anime_slug}")
             if r.status_code != 200:
                 logging.error(f"Error {r.status_code} al acceder a {anime_slug}")
                 return None, None
                 
             soup = BeautifulSoup(r.text, "html.parser")
-            episodios = soup.select("a.anime__row__item")
-            
+            # Selector de episodios de AnimeFLV
+            episodios = soup.select("ul.ListEpisodios li a")
             if not episodios:
                 logging.warning(f"No se encontraron episodios para {anime_slug}")
                 return None, None
                 
-            ultimo_ep_url = urljoin(BASE_URL, episodios[0]["href"])
+            ultimo_ep_url = urljoin(BASE_URL, episodios[-1]["href"])  # El último suele ser el más reciente
             partes_url = ultimo_ep_url.strip("/").split("/")
             num_capitulo = partes_url[-1] if partes_url[-1].isdigit() else "1"
 
-            # Entrar al episodio
-            r_ep = await client.get(ultimo_ep_url, impersonate="chrome")
+            # Entrar al episodio para buscar enlaces de descarga
+            r_ep = await client.get(ultimo_ep_url)
             soup_ep = BeautifulSoup(r_ep.text, "html.parser")
             
             enlace_descarga = None
-            # Buscar enlaces de descarga (mp4, um.php, etc)
+            # AnimeFLV suele tener los enlaces en una tabla o en iframes
             for a in soup_ep.find_all("a", href=True):
                 href = a["href"]
-                if ".mp4" in href or "um.php" in href or "desu" in href:
+                if ".mp4" in href or "download" in href or "stream" in href:
                     enlace_descarga = href
                     break
             
