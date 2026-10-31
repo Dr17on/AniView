@@ -19,48 +19,73 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
-OWNER_ID = int(os.getenv("OWNER_ID"))
+# Convertimos el ID a entero para evitar problemas con el filtro de Telegram
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
-# Configuración de scraping (AnimeFLV como ejemplo)
-BASE_URL = "https://www3.animeflv.net"
-SEARCH_URL = f"{BASE_URL}/buscador"
-ANIME_LIST = ["shingeki-no-kyojin", "jujutsu-kaisen"]  # IDs de ejemplo; ajústalos
+# Configuración para JKAnime (más permisivo con servidores gratuitos)
+BASE_URL = "https://jkanime.net"
+ANIME_LIST = ["shingeki-no-kyojin", "jujutsu-kaisen"]  # Slugs de JKAnime
 
 TEMP_DIR = Path("temp_videos")
 TEMP_DIR.mkdir(exist_ok=True)
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# Estado global simple (en producción, usa SQLite o un JSON)
+# Estado global simple
 estado = {"activo": True, "ultima_publicacion": "Nunca"}
 
-# ---------- SCRAPING LIGERO ----------
-async def obtener_enlaces_480p(anime_id: str):
-    """Devuelve una lista de (nombre_episodio, url_descarga_480p)."""
-    enlaces = []
-    async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
-        # 1. Página del anime para listar episodios
-        r = await client.get(f"{BASE_URL}/anime/{anime_id}")
-        soup = BeautifulSoup(r.text, "html.parser")
-        # Buscar enlaces a episodios (ajusta el selector según la estructura actual)
-        episodios = soup.select("ul.ListEpisodios li a")
-        for ep in episodios:
-            cap = ep.get_text(strip=True)
-            ep_url = urljoin(BASE_URL, ep["href"])
-            # 2. Página del episodio para extraer enlaces de servidores
-            r_ep = await client.get(ep_url)
+# Cabeceras para evitar bloqueos
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+}
+
+# ---------- SCRAPING LIGERO (JKAnime) ----------
+async def obtener_ultimo_episodio(anime_slug: str):
+    """Devuelve (num_episodio, url_descarga) del último episodio en JKAnime."""
+    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=30) as client:
+        try:
+            # 1. Obtener la página principal del anime
+            r = await client.get(f"{BASE_URL}/{anime_slug}/")
+            if r.status_code != 200:
+                logging.error(f"Error al acceder a {anime_slug}: HTTP {r.status_code}")
+                return None, None
+            
+            soup = BeautifulSoup(r.text, "html.parser")
+            
+            # Buscar el enlace del último episodio (suele ser el primero en la lista)
+            # En JKAnime, los episodios están en una lista con clase "anime__row__item"
+            episodios = soup.select("a.anime__row__item")
+            if not episodios:
+                return None, None
+                
+            ultimo_ep_url = urljoin(BASE_URL, episodios[0]["href"])
+            # Extraer el número de capítulo de la URL (ej: .../shingeki-no-kyojin/1/)
+            partes_url = ultimo_ep_url.strip("/").split("/")
+            num_capitulo = partes_url[-1] if partes_url[-1].isdigit() else "1"
+
+            # 2. Entrar a la página del episodio para buscar el enlace de descarga
+            r_ep = await client.get(ultimo_ep_url)
             soup_ep = BeautifulSoup(r_ep.text, "html.parser")
-            # Buscar el enlace de descarga de 480p (selector de ejemplo)
-            for link in soup_ep.select("a[href*='480p'], a:contains('480p')"):
-                href = link.get("href")
-                if href and ("480" in href or "480" in link.get_text().lower()):
-                    enlaces.append((cap, href))
-                    break  # solo el primero de 480p por episodio
-    return enlaces
+            
+            # Buscar el enlace de descarga directa (JKAnime usa varios servidores)
+            # Buscamos enlaces que terminen en .mp4 o que apunten a servidores de descarga
+            enlace_descarga = None
+            for a in soup_ep.find_all("a", href=True):
+                if ".mp4" in a["href"] or "um.php" in a["href"] or "desu" in a["href"]:
+                    enlace_descarga = a["href"]
+                    break
+            
+            if enlace_descarga:
+                return num_capitulo, enlace_descarga
+            return None, None
+
+        except Exception as e:
+            logging.error(f"Error en scraping de {anime_slug}: {e}")
+            return None, None
 
 # ---------- DESCARGA Y DIVISIÓN ----------
 async def descargar_video(url: str, destino: Path):
-    async with httpx.AsyncClient(follow_redirects=True, timeout=60) as client:
+    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=120) as client:
         async with client.stream("GET", url) as resp:
             resp.raise_for_status()
             with open(destino, "wb") as f:
@@ -70,49 +95,68 @@ async def descargar_video(url: str, destino: Path):
 
 def dividir_video(ruta_entrada: Path, tamano_max_mb: int = 45):
     """Divide el video en partes de menos de 45 MB usando FFmpeg sin recodificar."""
-    # Obtener duración
-    cmd_dur = [
-        "ffprobe", "-v", "error", "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1", str(ruta_entrada)
-    ]
-    duracion = float(subprocess.check_output(cmd_dur).strip())
-    tamano_mb = ruta_entrada.stat().st_size / (1024 * 1024)
-    num_partes = max(1, math.ceil(tamano_mb / tamano_max_mb))
-    dur_parte = duracion / num_partes
+    try:
+        cmd_dur = [
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", str(ruta_entrada)
+        ]
+        duracion = float(subprocess.check_output(cmd_dur).strip())
+        tamano_mb = ruta_entrada.stat().st_size / (1024 * 1024)
+        
+        num_partes = max(1, math.ceil(tamano_mb / tamano_max_mb))
+        dur_parte = duracion / num_partes
 
-    patron_salida = str(ruta_entrada.with_suffix("")) + "_parte_%03d.mp4"
-    cmd_div = [
-        "ffmpeg", "-i", str(ruta_entrada), "-c", "copy", "-map", "0",
-        "-f", "segment", "-segment_time", str(dur_parte),
-        "-reset_timestamps", "1", patron_salida
-    ]
-    subprocess.run(cmd_div, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        patron_salida = str(ruta_entrada.with_suffix("")) + "_parte_%03d.mp4"
+        cmd_div = [
+            "ffmpeg", "-i", str(ruta_entrada), "-c", "copy", "-map", "0",
+            "-f", "segment", "-segment_time", str(dur_parte),
+            "-reset_timestamps", "1", patron_salida
+        ]
+        subprocess.run(cmd_div, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    partes = sorted([
-        p for p in ruta_entrada.parent.glob(ruta_entrada.stem + "_parte_*.mp4")
-    ])
-    return partes
+        partes = sorted([
+            p for p in ruta_entrada.parent.glob(ruta_entrada.stem + "_parte_*.mp4")
+        ])
+        return partes
+    except Exception as e:
+        logging.error(f"Error al dividir video: {e}")
+        return [ruta_entrada] # Si falla, devuelve el original
 
 # ---------- PUBLICACIÓN ----------
 async def publicar_episodio(bot, nombre_anime: str, hashtag: str, capitulo: str, url_descarga: str):
     ruta_original = TEMP_DIR / f"{hashtag}_{capitulo}.mp4"
     try:
+        logging.info(f"Descargando {nombre_anime} Cap {capitulo}...")
         await descargar_video(url_descarga, ruta_original)
+        
+        logging.info("Descarga completada. Dividiendo si es necesario...")
         partes = dividir_video(ruta_original)
 
         for i, parte in enumerate(partes, start=1):
             caption = (
                 f"**{nombre_anime}**\n"
-                f"Capítulo {capitulo} (Parte {i}/{len(partes)})\n"
-                f"#{hashtag}\n"
+                f"Capítulo {capitulo}"
+            )
+            if len(partes) > 1:
+                caption += f" (Parte {i}/{len(partes)})"
+                
+            caption += (
+                f"\n\n#{hashtag}\n"
                 f"📢 Comparte: https://t.me/tu_canal"
             )
+            
             with open(parte, "rb") as video:
                 await bot.send_video(
-                    chat_id=CHANNEL_ID, video=video, caption=caption,
-                    parse_mode="Markdown", supports_streaming=True
+                    chat_id=CHANNEL_ID, 
+                    video=video, 
+                    caption=caption,
+                    parse_mode="Markdown", 
+                    supports_streaming=True
                 )
             parte.unlink(missing_ok=True)  # limpieza inmediata
+            
+        estado["ultima_publicacion"] = f"{nombre_anime} - Cap {capitulo}"
+        
     except Exception as e:
         logging.error(f"Error publicando {nombre_anime} {capitulo}: {e}")
     finally:
@@ -122,16 +166,12 @@ async def publicar_episodio(bot, nombre_anime: str, hashtag: str, capitulo: str,
 async def job_publicacion(context: ContextTypes.DEFAULT_TYPE):
     if not estado["activo"]:
         return
-    for anime_id in ANIME_LIST:
-        enlaces = await obtener_enlaces_480p(anime_id)
-        # Aquí deberías llevar un registro de episodios ya publicados (SQLite/JSON)
-        # Para el ejemplo, publicamos el último episodio encontrado
-        if enlaces:
-            cap, url = enlaces[-1]
-            nombre = anime_id.replace("-", " ").title()
+    for anime_slug in ANIME_LIST:
+        cap, url = await obtener_ultimo_episodio(anime_slug)
+        if url:
+            nombre = anime_slug.replace("-", " ").title()
             hashtag = "".join(filter(str.isalnum, nombre))
             await publicar_episodio(context.bot, nombre, hashtag, cap, url)
-            estado["ultima_publicacion"] = f"{nombre} - Cap {cap}"
 
 # ---------- PANEL DE CONTROL ----------
 def construir_panel():
@@ -153,13 +193,15 @@ def construir_panel():
 
 async def panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
-        return  # solo el dueño puede usar el panel
+        await update.message.reply_text(f"⛔ No tienes permiso. Tu ID es {update.effective_user.id}, pero el bot espera {OWNER_ID}.")
+        return
     texto, markup = construir_panel()
     await update.message.reply_text(texto, reply_markup=markup, parse_mode="Markdown")
 
 async def boton_pulsado(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    
     if query.from_user.id != OWNER_ID:
         return
 
@@ -167,10 +209,13 @@ async def boton_pulsado(update: Update, context: ContextTypes.DEFAULT_TYPE):
         estado["activo"] = not estado["activo"]
         texto, markup = construir_panel()
         await query.edit_message_text(texto, reply_markup=markup, parse_mode="Markdown")
+        
     elif query.data == "forzar":
+        await query.edit_message_text("⏳ Buscando y publicando... (esto puede tardar unos minutos)", parse_mode="Markdown")
         await job_publicacion(context)
         texto, markup = construir_panel()
         await query.edit_message_text(texto, reply_markup=markup, parse_mode="Markdown")
+        
     elif query.data == "lista":
         lista = "\n".join(f"• {a.replace('-', ' ').title()}" for a in ANIME_LIST)
         texto = f"**Animes en seguimiento:**\n{lista}"
@@ -180,12 +225,13 @@ async def boton_pulsado(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("panel", panel, filters=filters.User(OWNER_ID)))
+    app.add_handler(CommandHandler("panel", panel))
     app.add_handler(CallbackQueryHandler(boton_pulsado))
 
-    # Job cada 6 horas (ajusta el intervalo)
+    # Job cada 6 horas
     app.job_queue.run_repeating(job_publicacion, interval=6*3600, first=10)
 
+    logging.info("Bot iniciado correctamente. Esperando comandos...")
     app.run_polling()
 
 if __name__ == "__main__":
