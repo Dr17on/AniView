@@ -1,20 +1,17 @@
 import os
 import math
-import asyncio
 import subprocess
 import logging
 from pathlib import Path
-from urllib.parse import urljoin
+import asyncio
 
 import httpx
-from bs4 import BeautifulSoup
+import animesaturn as asaturn
 from dotenv import load_dotenv
-from curl_cffi.requests import AsyncSession
-
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
-    ContextTypes, filters
+    ContextTypes
 )
 
 load_dotenv()
@@ -23,9 +20,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
-# Configuración para AnimeFLV
-BASE_URL = "https://animeflv.net"
-ANIME_LIST = ["black-clover", "jujutsu-kaisen"]
+# Lista de animes a seguir (puedes poner los nombres exactos)
+ANIME_LIST = ["Black Clover", "Jujutsu Kaisen"]
 
 TEMP_DIR = Path("temp_videos")
 TEMP_DIR.mkdir(exist_ok=True)
@@ -33,64 +29,45 @@ TEMP_DIR.mkdir(exist_ok=True)
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 estado = {"activo": True, "ultima_publicacion": "Nunca"}
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-}
-
-# ---------- COMANDO START ----------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("⛔ No tienes permiso para usar este bot.")
-        return
-    await update.message.reply_text(
-        f"¡Hola! Soy tu bot publicador de anime. 🤖\n\n"
-        f"Para abrir el menú de control, usa el comando:\n👉 /panel"
-    )
-
-# ---------- SCRAPING CON ANIMEFLV ----------
-async def obtener_ultimo_episodio(anime_slug: str):
+# ---------- SCRAPING CON ANIMESATURN ----------
+async def obtener_ultimo_episodio(nombre_anime: str):
     try:
-        # Intentamos con httpx + User-Agent falso (suele funcionar en AnimeFLV)
-        async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=30) as client:
-            r = await client.get(f"{BASE_URL}/anime/{anime_slug}")
-            if r.status_code != 200:
-                logging.error(f"Error {r.status_code} al acceder a {anime_slug}")
-                return None, None
-                
-            soup = BeautifulSoup(r.text, "html.parser")
-            # Selector de episodios de AnimeFLV
-            episodios = soup.select("ul.ListEpisodios li a")
+        # La librería es síncrona, la ejecutamos en un hilo aparte
+        loop = asyncio.get_running_loop()
+        
+        def buscar_y_obtener():
+            # 1. Buscar el anime
+            resultados = asaturn.find(nombre_anime)
+            if not resultados:
+                return None, None, None
+            
+            anime = asaturn.Anime(resultados[0]['link'])
+            episodios = anime.getEpisodes()
             if not episodios:
-                logging.warning(f"No se encontraron episodios para {anime_slug}")
-                return None, None
-                
-            ultimo_ep_url = urljoin(BASE_URL, episodios[-1]["href"])  # El último suele ser el más reciente
-            partes_url = ultimo_ep_url.strip("/").split("/")
-            num_capitulo = partes_url[-1] if partes_url[-1].isdigit() else "1"
-
-            # Entrar al episodio para buscar enlaces de descarga
-            r_ep = await client.get(ultimo_ep_url)
-            soup_ep = BeautifulSoup(r_ep.text, "html.parser")
+                return None, None, None
             
-            enlace_descarga = None
-            # AnimeFLV suele tener los enlaces en una tabla o en iframes
-            for a in soup_ep.find_all("a", href=True):
-                href = a["href"]
-                if ".mp4" in href or "download" in href or "stream" in href:
-                    enlace_descarga = href
-                    break
+            ultimo_ep = episodios[-1]
+            servidores = ultimo_ep.getServer()
+            if not servidores:
+                return None, None, None
             
-            if enlace_descarga:
-                return num_capitulo, enlace_descarga
-            return None, None
-
+            # 2. Obtener el enlace de descarga directa
+            enlace = servidores[0].fileLink()
+            return anime.name, str(ultimo_ep.number), enlace
+        
+        nombre_real, num_cap, url_descarga = await loop.run_in_executor(None, buscar_y_obtener)
+        
+        if url_descarga:
+            return nombre_real, num_cap, url_descarga
+        return None, None, None
     except Exception as e:
-        logging.error(f"Error en scraping de {anime_slug}: {e}")
-        return None, None
+        logging.error(f"Error en scraping de {nombre_anime}: {e}")
+        return None, None, None
 
 # ---------- DESCARGA Y DIVISIÓN ----------
 async def descargar_video(url: str, destino: Path):
-    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=120) as client:
+    # AnimeSaturn no bloquea la descarga directa
+    async with httpx.AsyncClient(follow_redirects=True, timeout=120) as client:
         async with client.stream("GET", url) as resp:
             resp.raise_for_status()
             with open(destino, "wb") as f:
@@ -161,10 +138,9 @@ async def publicar_episodio(bot, nombre_anime: str, hashtag: str, capitulo: str,
 async def job_publicacion(context: ContextTypes.DEFAULT_TYPE):
     if not estado["activo"]:
         return
-    for anime_slug in ANIME_LIST:
-        cap, url = await obtener_ultimo_episodio(anime_slug)
+    for nombre_anime in ANIME_LIST:
+        nombre, cap, url = await obtener_ultimo_episodio(nombre_anime)
         if url:
-            nombre = anime_slug.replace("-", " ").title()
             hashtag = "".join(filter(str.isalnum, nombre))
             await publicar_episodio(context.bot, nombre, hashtag, cap, url)
 
@@ -185,7 +161,7 @@ def construir_panel():
 
 async def panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text(f"⛔ No tienes permiso. Tu ID es {update.effective_user.id}")
+        await update.message.reply_text("⛔ No tienes permiso.")
         return
     texto, markup = construir_panel()
     await update.message.reply_text(texto, reply_markup=markup, parse_mode="Markdown")
@@ -199,27 +175,24 @@ async def boton_pulsado(update: Update, context: ContextTypes.DEFAULT_TYPE):
         estado["activo"] = not estado["activo"]
         texto, markup = construir_panel()
         await query.edit_message_text(texto, reply_markup=markup, parse_mode="Markdown")
-        
     elif query.data == "forzar":
-        await query.edit_message_text("⏳ Buscando y publicando... (esto puede tardar)", parse_mode="Markdown")
+        await query.edit_message_text("⏳ Buscando y publicando...", parse_mode="Markdown")
         await job_publicacion(context)
         texto, markup = construir_panel()
         await query.edit_message_text(texto, reply_markup=markup, parse_mode="Markdown")
-        
     elif query.data == "lista":
-        lista = "\n".join(f"• {a.replace('-', ' ').title()}" for a in ANIME_LIST)
+        lista = "\n".join(f"• {a}" for a in ANIME_LIST)
         texto = f"**Animes en seguimiento:**\n{lista}"
         await query.edit_message_text(texto, parse_mode="Markdown")
 
 # ---------- MAIN ----------
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("panel", panel))
     app.add_handler(CallbackQueryHandler(boton_pulsado))
     app.job_queue.run_repeating(job_publicacion, interval=6*3600, first=10)
     
-    logging.info("Bot iniciado correctamente. Esperando comandos...")
+    logging.info("Bot iniciado correctamente.")
     app.run_polling()
 
 if __name__ == "__main__":
